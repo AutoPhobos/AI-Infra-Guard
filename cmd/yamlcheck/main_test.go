@@ -314,3 +314,131 @@ func collectRuleNames(t *testing.T, dirs ...string) map[string][]string {
 	}
 	return byName
 }
+
+func TestPartitionOrphans(t *testing.T) {
+	orphan := func(name string, files ...string) ruleNameOrphan {
+		return ruleNameOrphan{RuleName: name, Files: files}
+	}
+
+	tests := []struct {
+		name           string
+		orphans        []ruleNameOrphan
+		ruleFiles      map[string][]string
+		allowed        []string
+		wantUnexpected []ruleNameOrphan
+		wantStale      []string
+	}{
+		{
+			name:           "orphan outside the allowlist must fail",
+			orphans:        []ruleNameOrphan{orphan("typoed-name", "data/vuln/x/CVE-1.yaml")},
+			ruleFiles:      map[string][]string{"typoed-name": {"data/vuln/x/CVE-1.yaml"}},
+			allowed:        []string{"pyload-ng"},
+			wantUnexpected: []ruleNameOrphan{orphan("typoed-name", "data/vuln/x/CVE-1.yaml")},
+		},
+		{
+			name:      "allowlisted orphan is exempt",
+			orphans:   []ruleNameOrphan{orphan("pyload-ng", "data/vuln/pyload-ng/CVE-1.yaml")},
+			ruleFiles: map[string][]string{"pyload-ng": {"data/vuln/pyload-ng/CVE-1.yaml"}},
+			allowed:   []string{"pyload-ng"},
+		},
+		{
+			name:      "allowlisted name that gained a fingerprint is stale",
+			orphans:   nil,
+			ruleFiles: map[string][]string{"pyload-ng": {"data/vuln/pyload-ng/CVE-1.yaml"}},
+			allowed:   []string{"pyload-ng"},
+			wantStale: []string{"pyload-ng"},
+		},
+		{
+			name:      "allowlisted name absent from this run is NOT stale",
+			orphans:   nil,
+			ruleFiles: map[string][]string{"vllm": {"data/vuln/vllm/CVE-1.yaml"}},
+			allowed:   []string{"pyload-ng", "simstudioai"},
+		},
+		{
+			name:      "allowlist is matched exactly, not case-insensitively",
+			orphans:   []ruleNameOrphan{orphan("PyLoad-NG", "data/vuln/x/CVE-1.yaml")},
+			ruleFiles: map[string][]string{"PyLoad-NG": {"data/vuln/x/CVE-1.yaml"}},
+			allowed:   []string{"pyload-ng"},
+			// Differs only by case from the exemption, so it is not exempt:
+			// the name must be fixed, not allowlisted. The exemption itself is
+			// not stale either — no rule in this run carries its exact name,
+			// so the run says nothing about whether that gap still exists.
+			wantUnexpected: []ruleNameOrphan{orphan("PyLoad-NG", "data/vuln/x/CVE-1.yaml")},
+		},
+		{
+			name: "stale names are sorted",
+			ruleFiles: map[string][]string{
+				"zeta": {"data/vuln/zeta/CVE-1.yaml"},
+				"beta": {"data/vuln/beta/CVE-1.yaml"},
+			},
+			allowed:   []string{"zeta", "beta"},
+			wantStale: []string{"beta", "zeta"},
+		},
+		{
+			name:    "empty allowlist leaves every orphan failing",
+			orphans: []ruleNameOrphan{orphan("a", "f1"), orphan("b", "f2")},
+			ruleFiles: map[string][]string{
+				"a": {"f1"},
+				"b": {"f2"},
+			},
+			wantUnexpected: []ruleNameOrphan{orphan("a", "f1"), orphan("b", "f2")},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotUnexpected, gotStale := partitionOrphans(tt.orphans, tt.ruleFiles, tt.allowed)
+			if !reflect.DeepEqual(gotUnexpected, tt.wantUnexpected) {
+				t.Errorf("unexpected = %#v, want %#v", gotUnexpected, tt.wantUnexpected)
+			}
+			if !reflect.DeepEqual(gotStale, tt.wantStale) {
+				t.Errorf("stale = %#v, want %#v", gotStale, tt.wantStale)
+			}
+		})
+	}
+}
+
+// TestShippedRuleNamesAreReachable is the whole-library reachability gate: a
+// CVE rule can only ever surface in a scan through the name its fingerprint
+// declares, so every shipped rule name must either match a fingerprint name
+// exactly or be a recorded coverage gap. This catches the entire class at once
+// — case drift, non-case drift (e.g. "New API" vs "new-api") and rules for
+// products with no detector — rather than one product at a time.
+func TestShippedRuleNamesAreReachable(t *testing.T) {
+	fingerprintNames := collectFingerprintNames(t, filepath.Join("..", "..", "data", "fingerprints"))
+	ruleFilesByName := collectRuleNames(t,
+		filepath.Join("..", "..", "data", "vuln"),
+		filepath.Join("..", "..", "data", "vuln_en"),
+	)
+
+	_, orphans := findRuleNameMismatches(fingerprintNames, ruleFilesByName)
+	unexpected, stale := partitionOrphans(orphans, ruleFilesByName, knownMissingFingerprints)
+
+	for _, orphan := range unexpected {
+		t.Errorf("rule name %q has no fingerprint, so no scan can report its %d rule file(s): %s\n"+
+			"\tfix the name to match a fingerprint, add a fingerprint rule, or record the gap in known_gaps.go",
+			orphan.RuleName, len(orphan.Files), strings.Join(orphan.Files, ", "))
+	}
+	for _, name := range stale {
+		t.Errorf("knownMissingFingerprints entry %q now has a fingerprint; remove it from known_gaps.go", name)
+	}
+}
+
+// The allowlist is reviewed by humans and may only shrink, so keep it sorted
+// and duplicate-free to stop diffs from hiding additions.
+func TestKnownMissingFingerprintsIsSortedAndUnique(t *testing.T) {
+	seen := make(map[string]struct{}, len(knownMissingFingerprints))
+	for i, name := range knownMissingFingerprints {
+		if name != strings.TrimSpace(name) || name == "" {
+			t.Errorf("entry %d (%q) must be non-empty and free of surrounding whitespace", i, name)
+		}
+		if _, dup := seen[name]; dup {
+			t.Errorf("entry %d (%q) is a duplicate", i, name)
+		}
+		seen[name] = struct{}{}
+		if i > 0 && knownMissingFingerprints[i-1] > name {
+			t.Errorf("entry %d (%q) is out of order: it should sort before %q",
+				i, name, knownMissingFingerprints[i-1])
+		}
+	}
+}

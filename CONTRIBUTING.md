@@ -32,7 +32,9 @@ A.I.G's plugin framework is designed so most contributions don't require touchin
 
 For each, please follow the existing file format/naming convention in that directory as a template, and briefly explain in your PR description what the new rule/dataset detects and how you validated it (e.g. a real target it correctly fingerprints, or a known CVE it correctly matches).
 
-A vulnerability rule's `info.name` is what links it to a fingerprint, so spell it exactly as the fingerprint rule spells its own `info.name` — `vllm`, not `vLLM`. `yamlcheck` fails on a rule name that differs from a fingerprint's only by case, and warns about rules for a product that has no fingerprint yet. If you add CVE rules for a product A.I.G cannot fingerprint, a fingerprint rule for it is a welcome companion PR.
+A vulnerability rule's `info.name` is what links it to a fingerprint, so spell it exactly as the fingerprint rule spells its own `info.name` — `vllm`, not `vLLM`; `new-api`, not `New API`. A scan looks advisories up by the matched fingerprint's name, so a rule no fingerprint declares can never be reported, however correct its contents: it is dead weight on disk, and worse than a missing rule, because it looks like coverage you have.
+
+`yamlcheck` therefore **fails** when a rule name matches no fingerprint name, whether it differs by case or by spelling. If a product genuinely has no detector yet, a fingerprint rule for it is the most useful thing you can contribute; if writing one is out of scope for your PR, record the gap by adding the name to `knownMissingFingerprints` in [`cmd/yamlcheck/known_gaps.go`](cmd/yamlcheck/known_gaps.go). That list may only shrink — `yamlcheck` also fails on an entry that has since gained a fingerprint, so closing a gap means deleting its line. Never add a name there to silence a misspelling.
 
 Core module changes (Go backend, frontend, scan engines) are welcome too — please open an issue first for anything beyond a small bugfix.
 

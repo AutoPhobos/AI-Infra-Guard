@@ -147,14 +147,40 @@ func main() {
 	if len(fingerprintNames) > 0 && len(ruleFilesByName) > 0 {
 		mismatches, orphans := findRuleNameMismatches(fingerprintNames, ruleFilesByName)
 
-		if len(orphans) > 0 {
+		unexpected, stale := partitionOrphans(orphans, ruleFilesByName, knownMissingFingerprints)
+
+		if len(unexpected) > 0 {
+			hasError = true
 			fmt.Println()
-			fmt.Println("⚠️  [no fingerprint] CVE rules for products with no fingerprint rule.")
-			fmt.Println("    A scan cannot report these until a fingerprint declares the name:")
-			for _, orphan := range orphans {
-				fmt.Printf("  - %q (%d rule file(s)), e.g. %s\n",
-					orphan.RuleName, len(orphan.Files), orphan.Files[0])
+			fmt.Fprintln(os.Stderr, "❌ [no fingerprint] CVE rules for products no fingerprint rule declares.")
+			fmt.Fprintln(os.Stderr, "    A scan looks advisories up by the matched fingerprint's name, so no scan can")
+			fmt.Fprintln(os.Stderr, "    ever report these rules. Either fix the name to match an existing")
+			fmt.Fprintln(os.Stderr, "    fingerprint, or add a fingerprint rule that declares it:")
+			for _, orphan := range unexpected {
+				fmt.Fprintf(os.Stderr, "  - %q (%d rule file(s)):\n", orphan.RuleName, len(orphan.Files))
+				for _, file := range orphan.Files {
+					fmt.Fprintf(os.Stderr, "      └─ %s\n", file)
+				}
 			}
+			fmt.Fprintln(os.Stderr, "    If the product genuinely has no detector yet and writing one is out of scope,")
+			fmt.Fprintln(os.Stderr, "    add the name to knownMissingFingerprints in cmd/yamlcheck/known_gaps.go.")
+		}
+
+		if len(stale) > 0 {
+			hasError = true
+			fmt.Println()
+			fmt.Fprintln(os.Stderr, "❌ [stale exemption] knownMissingFingerprints names that now HAVE a fingerprint.")
+			fmt.Fprintln(os.Stderr, "    The coverage gap is closed; remove these from cmd/yamlcheck/known_gaps.go")
+			fmt.Fprintln(os.Stderr, "    so the list keeps shrinking:")
+			for _, name := range stale {
+				fmt.Fprintf(os.Stderr, "  - %q\n", name)
+			}
+		}
+
+		if exempted := len(orphans) - len(unexpected); exempted > 0 {
+			fmt.Println()
+			fmt.Printf("⚠️  [known coverage gap] %d rule name(s) have no fingerprint yet and are\n", exempted)
+			fmt.Println("    exempted in cmd/yamlcheck/known_gaps.go. No scan can report their rules.")
 		}
 
 		if len(mismatches) > 0 {
@@ -229,9 +255,10 @@ type ruleNameOrphan struct {
 // findRuleNameMismatches cross-references CVE rule names against fingerprint
 // names. A rule is reachable from a scan only through the name its fingerprint
 // declares, so a rule whose name differs in case is a defect to fix (the
-// advisory engine folds case, but the knowledge API and the Python infra-attack
-// module both key off the literal name), while a rule name no fingerprint
-// declares at all is reported separately as a coverage gap.
+// advisory engine folds case, but the knowledge API derives a rule's on-disk
+// directory from the literal name, so the two spellings must still agree),
+// while a rule name no fingerprint declares at all is returned separately —
+// nothing can reach those rules, whatever the comparison.
 //
 // Both results are sorted by rule name, and each file list is sorted, so the
 // output is stable across runs.
@@ -282,6 +309,56 @@ func findRuleNameMismatches(fingerprintNames []string, ruleFilesByName map[strin
 	}
 
 	return mismatches, orphans
+}
+
+// partitionOrphans splits rule names that no fingerprint declares into the ones
+// that must fail the run and the exemptions that are no longer needed.
+//
+// unexpected: an orphan absent from the allowlist. No scan can report its
+// rules, so it fails the run — either the name is wrong, or the product needs a
+// fingerprint rule.
+//
+// stale: an allowlist entry whose rules are in this run but that is no longer
+// an orphan, i.e. a fingerprint now declares it. Failing on these is what keeps
+// the allowlist shrink-only; an exemption that outlives its gap would silently
+// re-open the hole it covered. An entry whose rules are absent from this run is
+// NOT stale — a partial run (say `yamlcheck data/fingerprints data/vuln/vllm`)
+// says nothing about products it did not look at.
+//
+// Allowlist entries are matched exactly, not case-insensitively: a name that
+// differs from a fingerprint's only by case is already reported as a mismatch,
+// and must be fixed rather than exempted.
+//
+// Both results are sorted, so the output is stable across runs.
+func partitionOrphans(orphans []ruleNameOrphan, ruleFilesByName map[string][]string, allowed []string) ([]ruleNameOrphan, []string) {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		allowedSet[name] = struct{}{}
+	}
+
+	orphanSet := make(map[string]struct{}, len(orphans))
+	var unexpected []ruleNameOrphan
+	for _, orphan := range orphans {
+		orphanSet[orphan.RuleName] = struct{}{}
+		if _, ok := allowedSet[orphan.RuleName]; !ok {
+			unexpected = append(unexpected, orphan)
+		}
+	}
+
+	var stale []string
+	for _, name := range allowed {
+		if _, inRun := ruleFilesByName[name]; !inRun {
+			continue
+		}
+		if _, isOrphan := orphanSet[name]; !isOrphan {
+			stale = append(stale, name)
+		}
+	}
+	sort.Strings(stale)
+
+	// findRuleNameMismatches already returns orphans sorted by rule name, and
+	// filtering preserves that order.
+	return unexpected, stale
 }
 
 // findCaseInsensitivePathCollisions returns distinct paths that become equal

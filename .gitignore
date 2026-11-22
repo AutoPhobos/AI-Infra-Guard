@@ -18,7 +18,10 @@ venv
 # OpenClaw internal workspace file
 openclaw.md
 .xac/
-yamlcheck
+# Built binary at the repo root. Anchored with a leading slash: a bare
+# "yamlcheck" also matches the cmd/yamlcheck/ source directory, which silently
+# ignores any newly added file there.
+/yamlcheck
 .workbuddy
 .pytest_cache
 services/api_checker/.venv/
