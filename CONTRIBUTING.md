@@ -32,6 +32,8 @@ A.I.G's plugin framework is designed so most contributions don't require touchin
 
 For each, please follow the existing file format/naming convention in that directory as a template, and briefly explain in your PR description what the new rule/dataset detects and how you validated it (e.g. a real target it correctly fingerprints, or a known CVE it correctly matches).
 
+A vulnerability rule's `info.name` is what links it to a fingerprint, so spell it exactly as the fingerprint rule spells its own `info.name` — `vllm`, not `vLLM`. `yamlcheck` fails on a rule name that differs from a fingerprint's only by case, and warns about rules for a product that has no fingerprint yet. If you add CVE rules for a product A.I.G cannot fingerprint, a fingerprint rule for it is a welcome companion PR.
+
 Core module changes (Go backend, frontend, scan engines) are welcome too — please open an issue first for anything beyond a small bugfix.
 
 ## Submitting a pull request

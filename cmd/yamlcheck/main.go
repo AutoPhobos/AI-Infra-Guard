@@ -76,6 +76,11 @@ func main() {
 	passCount := 0
 	failCount := 0
 
+	// Names declared by the fingerprint rules, and the rule files that refer
+	// to each name, collected for the cross-reference check below.
+	var fingerprintNames []string
+	ruleFilesByName := make(map[string][]string)
+
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════╗")
 	fmt.Println("║          AIG YAML Validation Report          ║")
@@ -109,6 +114,7 @@ func main() {
 				hasError = true
 				failCount++
 			} else {
+				fingerprintNames = append(fingerprintNames, strings.TrimSpace(fp.Info.Name))
 				fmt.Printf("  ✅  PASS  [fingerprint]  %s\n", file)
 				passCount++
 			}
@@ -127,8 +133,42 @@ func main() {
 				hasError = true
 				failCount++
 			} else {
+				name := strings.TrimSpace(vul.Info.FingerPrintName)
+				ruleFilesByName[name] = append(ruleFilesByName[name], filepath.ToSlash(file))
 				fmt.Printf("  ✅  PASS  [vuln rule]   %s\n", file)
 				passCount++
+			}
+		}
+	}
+
+	// Cross-reference rule names against fingerprint names. Only meaningful
+	// when fingerprints were part of this run; validating data/vuln on its own
+	// says nothing about which names exist.
+	if len(fingerprintNames) > 0 && len(ruleFilesByName) > 0 {
+		mismatches, orphans := findRuleNameMismatches(fingerprintNames, ruleFilesByName)
+
+		if len(orphans) > 0 {
+			fmt.Println()
+			fmt.Println("⚠️  [no fingerprint] CVE rules for products with no fingerprint rule.")
+			fmt.Println("    A scan cannot report these until a fingerprint declares the name:")
+			for _, orphan := range orphans {
+				fmt.Printf("  - %q (%d rule file(s)), e.g. %s\n",
+					orphan.RuleName, len(orphan.Files), orphan.Files[0])
+			}
+		}
+
+		if len(mismatches) > 0 {
+			hasError = true
+			fmt.Println()
+			fmt.Fprintln(os.Stderr, "❌ [name case mismatch] rule 'name' differs from the fingerprint's 'name' only by case.")
+			fmt.Fprintln(os.Stderr, "    The scanner looks advisories up by the matched fingerprint's name, and the")
+			fmt.Fprintln(os.Stderr, "    knowledge API derives a rule's directory from it, so spell it the same way:")
+			for _, mismatch := range mismatches {
+				fmt.Fprintf(os.Stderr, "  - %q should be %q (%d rule file(s)):\n",
+					mismatch.RuleName, mismatch.FingerprintName, len(mismatch.Files))
+				for _, file := range mismatch.Files {
+					fmt.Fprintf(os.Stderr, "      └─ %s\n", file)
+				}
 			}
 		}
 	}
@@ -169,6 +209,79 @@ func isValidSeverity(severity string) bool {
 	default:
 		return false
 	}
+}
+
+// ruleNameMismatch is a CVE rule 'name' that matches a fingerprint 'name'
+// only after folding case, e.g. rule "vLLM" against fingerprint "vllm".
+type ruleNameMismatch struct {
+	RuleName        string
+	FingerprintName string
+	Files           []string
+}
+
+// ruleNameOrphan is a CVE rule 'name' that no fingerprint declares at all,
+// in any casing — the product has rules but no fingerprint yet.
+type ruleNameOrphan struct {
+	RuleName string
+	Files    []string
+}
+
+// findRuleNameMismatches cross-references CVE rule names against fingerprint
+// names. A rule is reachable from a scan only through the name its fingerprint
+// declares, so a rule whose name differs in case is a defect to fix (the
+// advisory engine folds case, but the knowledge API and the Python infra-attack
+// module both key off the literal name), while a rule name no fingerprint
+// declares at all is reported separately as a coverage gap.
+//
+// Both results are sorted by rule name, and each file list is sorted, so the
+// output is stable across runs.
+func findRuleNameMismatches(fingerprintNames []string, ruleFilesByName map[string][]string) ([]ruleNameMismatch, []ruleNameOrphan) {
+	// Fold fingerprint names, keeping the lexicographically first spelling so
+	// the suggestion is deterministic even if two fingerprints disagree.
+	folded := make(map[string]string, len(fingerprintNames))
+	exact := make(map[string]struct{}, len(fingerprintNames))
+	for _, name := range fingerprintNames {
+		if name == "" {
+			continue
+		}
+		exact[name] = struct{}{}
+		key := strings.ToLower(name)
+		if current, ok := folded[key]; !ok || name < current {
+			folded[key] = name
+		}
+	}
+
+	ruleNames := make([]string, 0, len(ruleFilesByName))
+	for name := range ruleFilesByName {
+		ruleNames = append(ruleNames, name)
+	}
+	sort.Strings(ruleNames)
+
+	var mismatches []ruleNameMismatch
+	var orphans []ruleNameOrphan
+	for _, name := range ruleNames {
+		if name == "" {
+			continue
+		}
+		if _, ok := exact[name]; ok {
+			continue
+		}
+		files := make([]string, len(ruleFilesByName[name]))
+		copy(files, ruleFilesByName[name])
+		sort.Strings(files)
+
+		if fingerprintName, ok := folded[strings.ToLower(name)]; ok {
+			mismatches = append(mismatches, ruleNameMismatch{
+				RuleName:        name,
+				FingerprintName: fingerprintName,
+				Files:           files,
+			})
+			continue
+		}
+		orphans = append(orphans, ruleNameOrphan{RuleName: name, Files: files})
+	}
+
+	return mismatches, orphans
 }
 
 // findCaseInsensitivePathCollisions returns distinct paths that become equal
